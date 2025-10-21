@@ -1,0 +1,12 @@
+[package]
+name = "grpc-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+solana-sdk = "2.2.2"
+solana-transaction-status = "2.2.2"
+tokio = "1.48.0"
+yellowstone-grpc-client = "8.0.0"
+yellowstone-grpc-proto = "8.0.0"
