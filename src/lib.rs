@@ -4,9 +4,7 @@ use solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::VersionedTra
 use solana_transaction_status::TransactionStatusMeta;
 use tokio::sync::Mutex;
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient, Interceptor};
-use yellowstone_grpc_proto::{
-    convert_from::create_tx_with_meta, geyser::SubscribeUpdateTransaction,
-};
+use yellowstone_grpc_proto::{convert_from::create_tx_with_meta, geyser::SubscribeUpdateTransaction};
 
 use anyhow::Error;
 #[derive(Debug)]
@@ -32,6 +30,14 @@ pub struct TransactionFormat {
     #[allow(dead_code)]
     pub transation: VersionedTransaction,
     pub account_keys: Vec<Pubkey>,
+}
+
+impl TransactionFormat {
+    /// 交易是否成功执行。
+    /// 失败交易（revert 但仍消耗 CU + tip）返回 false。
+    pub fn is_successful(&self) -> bool {
+        self.meta.as_ref().map(|m| m.status.is_ok()).unwrap_or(false)
+    }
 }
 
 impl From<SubscribeUpdateTransaction> for TransactionFormat {
@@ -60,9 +66,7 @@ impl YellowstoneGrpc {
         Self { endpoint, x_token }
     }
 
-    pub async fn build_client(
-        self,
-    ) -> Result<Arc<Mutex<GeyserGrpcClient<impl Interceptor>>>, AppError> {
+    pub async fn build_client(self) -> Result<Arc<Mutex<GeyserGrpcClient<impl Interceptor>>>, AppError> {
         let client = GeyserGrpcClient::build_from_shared(self.endpoint)?
             .x_token(self.x_token)?
             .tls_config(ClientTlsConfig::new().with_native_roots())?
