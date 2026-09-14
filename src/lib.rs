@@ -11,12 +11,15 @@ use solana_sdk::{
     signature::Signature,
     transaction::VersionedTransaction,
 };
+use solana_transaction_error::TransactionError;
+use solana_transaction_status::TransactionStatusMeta;
 use tokio::sync::Mutex;
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::{
     geyser::SubscribeUpdateTransaction,
     solana::storage::confirmed_block::{
-        Message as ProtoMessage, Transaction as ProtoTransaction, TransactionStatusMeta,
+        Message as ProtoMessage, Transaction as ProtoTransaction,
+        TransactionStatusMeta as ProtoTransactionStatusMeta,
     },
 };
 
@@ -33,10 +36,10 @@ where
     }
 }
 
-/// 一笔交易：标识 + 执行结果(proto meta) + solana 原生交易。
+/// 一笔交易：标识 + 执行结果(official meta) + solana 原生交易。
 ///
-/// - `meta`: proto 的 `TransactionStatusMeta`（自带 `err`，`err.is_none()` 即成功），
-///   不依赖 `solana_transaction_status`，避免其 wincode 依赖冲突。
+/// - `meta`: 官方工具链的 `solana_transaction_status::TransactionStatusMeta`。
+///   由 geyser proto 的 meta 映射而来，成功与否看 `meta.status.is_ok()`。
 /// - `transaction`: solana 原生 `VersionedTransaction`。proto 把交易的
 ///   `message` 已解析成字段，这里按 `versioned`/`config` 分支组装成
 ///   `Legacy`/`V0`/`V1` 三种原生消息。
@@ -52,7 +55,10 @@ pub struct TransactionFormat {
 impl TransactionFormat {
     /// 交易是否成功执行。失败交易（revert 但仍消耗 CU + tip）返回 false。
     pub fn is_successful(&self) -> bool {
-        self.meta.as_ref().map(|m| m.err.is_none()).unwrap_or(false)
+        self.meta
+            .as_ref()
+            .map(|m| m.status.is_ok())
+            .unwrap_or(false)
     }
 }
 
@@ -78,6 +84,136 @@ fn map_instructions(ins: &ProtoMessage) -> Vec<CompiledInstruction> {
             data: i.data.clone(),
         })
         .collect()
+}
+
+/// 把 geyser proto 的 `TransactionStatusMeta` 映射成官方
+/// `solana_transaction_status::TransactionStatusMeta`。
+///
+/// 字段差异处理：
+/// - `err: Option<proto TransactionError>` -> `status: TransactionResult<()>`，
+///   proto 用 bincode 序列化官方 `TransactionError`，这里反序列化还原；
+///   解码失败时退化为 `TransactionError::InvalidAccountData`（仅在网络返回
+///   非法字节时发生，正常路径不会走到）。
+/// - proto 的 `*_none: bool`（显式"无值"标记）-> 官方 `Option<...>::None`。
+/// - `loaded_writable/readonly_addresses` -> `LoadedAddresses`。
+fn to_official_meta(p: &ProtoTransactionStatusMeta) -> TransactionStatusMeta {
+    use solana_account_decoder_client_types::token::UiTokenAmount;
+    use solana_transaction_context::transaction::TransactionReturnData;
+    use solana_transaction_status::{
+        InnerInstruction, InnerInstructions, Reward, RewardType, TransactionTokenBalance,
+    };
+
+    let status = match p.err.as_ref() {
+        None => Ok(()),
+        Some(e) => match bincode::deserialize::<TransactionError>(e.err.as_slice()) {
+            Ok(err) => Err(err),
+            Err(_) => Err(TransactionError::InvalidAccountIndex),
+        },
+    };
+
+    let inner_instructions = if p.inner_instructions_none {
+        None
+    } else {
+        Some(
+            p.inner_instructions
+                .iter()
+                .map(|ii| InnerInstructions {
+                    index: ii.index as u8,
+                    instructions: ii
+                        .instructions
+                        .iter()
+                        .map(|i| InnerInstruction {
+                            instruction: CompiledInstruction {
+                                program_id_index: i.program_id_index as u8,
+                                accounts: i.accounts.clone(),
+                                data: i.data.clone(),
+                            },
+                            stack_height: i.stack_height,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
+    };
+
+    let log_messages = if p.log_messages_none {
+        None
+    } else {
+        Some(p.log_messages.clone())
+    };
+
+    let token_balances = |v: &[yellowstone_grpc_proto::solana::storage::confirmed_block::TokenBalance]| {
+        v.iter()
+            .map(|b| TransactionTokenBalance {
+                account_index: b.account_index as u8,
+                mint: b.mint.clone(),
+                ui_token_amount: match b.ui_token_amount.as_ref() {
+                    Some(a) => UiTokenAmount {
+                        ui_amount: Some(a.ui_amount),
+                        decimals: a.decimals as u8,
+                        amount: a.amount.clone(),
+                        ui_amount_string: a.ui_amount_string.clone(),
+                    },
+                    None => UiTokenAmount {
+                        ui_amount: None,
+                        decimals: 0,
+                        amount: String::new(),
+                        ui_amount_string: String::new(),
+                    },
+                },
+                owner: b.owner.clone(),
+                program_id: b.program_id.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let rewards = p
+        .rewards
+        .iter()
+        .map(|r| Reward {
+            pubkey: r.pubkey.clone(),
+            lamports: r.lamports,
+            post_balance: r.post_balance,
+            reward_type: match r.reward_type {
+                0 => None,
+                1 => Some(RewardType::Fee),
+                2 => Some(RewardType::Rent),
+                3 => Some(RewardType::Staking),
+                4 => Some(RewardType::Voting),
+                _ => None,
+            },
+            commission: r.commission.parse().ok(),
+            commission_bps: r.commission_bps.parse().ok(),
+        })
+        .collect::<Vec<_>>();
+
+    let return_data = if p.return_data_none {
+        None
+    } else {
+        p.return_data.as_ref().map(|rd| TransactionReturnData {
+            program_id: Pubkey::try_from(rd.program_id.as_slice()).unwrap_or_default(),
+            data: rd.data.clone(),
+        })
+    };
+
+    TransactionStatusMeta {
+        status,
+        fee: p.fee,
+        pre_balances: p.pre_balances.clone(),
+        post_balances: p.post_balances.clone(),
+        inner_instructions,
+        log_messages,
+        pre_token_balances: Some(token_balances(&p.pre_token_balances)),
+        post_token_balances: Some(token_balances(&p.post_token_balances)),
+        rewards: Some(rewards),
+        loaded_addresses: v0::LoadedAddresses {
+            writable: keys_from_bytes(&p.loaded_writable_addresses).unwrap_or_default(),
+            readonly: keys_from_bytes(&p.loaded_readonly_addresses).unwrap_or_default(),
+        },
+        return_data,
+        compute_units_consumed: p.compute_units_consumed,
+        cost_units: p.cost_units,
+    }
 }
 
 /// 把 geyser proto 交易组装成 solana 原生 `VersionedTransaction`。
@@ -177,7 +313,7 @@ impl TransactionFormat {
         Ok(Self {
             slot,
             index: info.index,
-            meta: info.meta,
+            meta: info.meta.as_ref().map(to_official_meta),
             transaction: to_versioned_transaction(&proto)?,
         })
     }
