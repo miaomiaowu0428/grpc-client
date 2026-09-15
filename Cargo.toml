@@ -15,5 +15,3 @@ solana-transaction-status = { version = "4.2.2", features = ["agave-unstable-api
 tokio = "1.53.1"
 yellowstone-grpc-client = "13.5.0"
 yellowstone-grpc-proto = "12.7.0"
-
-[workspace]
