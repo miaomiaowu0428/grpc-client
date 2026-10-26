@@ -15,3 +15,8 @@ solana-transaction-status = { version = "4.2.2", features = ["agave-unstable-api
 tokio = "1.53.1"
 yellowstone-grpc-client = "13.5.0"
 yellowstone-grpc-proto = "12.7.0"
+# gzip 响应压缩：`CompressionEncoding::Gzip` 这个变体和解压实现都由 tonic 的
+# `gzip` feature 控制。yellowstone-grpc-client 只开了 tls-native-roots，所以这里
+# 显式开 gzip —— 同 semver 的 feature 会合并到依赖图里那一份 tonic 0.14 上。
+# 注意：开 feature 才有 Gzip 变体，千万别删。
+tonic = { version = "0.14", default-features = false, features = ["gzip"] }

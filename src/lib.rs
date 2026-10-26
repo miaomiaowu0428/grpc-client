@@ -1,5 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
+use tonic::codec::CompressionEncoding;
+
 use anyhow::{anyhow, Error, Result};
 use solana_sdk::{
     hash::Hash,
@@ -328,17 +330,55 @@ impl From<SubscribeUpdateTransaction> for TransactionFormat {
 pub struct YellowstoneGrpc {
     endpoint: String,
     x_token: Option<String>,
+    /// **服务端 → 客户端**方向的响应压缩编码；`None` = 不请求压缩（identity）。
+    ///
+    /// 默认 `None`，与旧版行为一致；由调用方显式 [`Self::gzip`] 打开
+    /// （`transaction-monitor` 的订阅循环按 `YELLOWSTONE_GRPC_COMPRESSION_ENCODING`
+    /// 决定，默认 gzip）。
+    ///
+    /// 对应 tonic 客户端的 `accept_compressed`：握手时发 `grpc-accept-encoding: gzip`，
+    /// 服务端（yellowstone-geyser 默认 `compression.send = [gzip, zstd]`）才会压着回包。
+    /// 服务端不支持时会忽略这个头、照样发明文，不会报错。
+    accept_compression: Option<CompressionEncoding>,
 }
 
 impl YellowstoneGrpc {
     pub fn new(endpoint: String, x_token: Option<String>) -> Self {
-        Self { endpoint, x_token }
+        Self {
+            endpoint,
+            x_token,
+            accept_compression: None,
+        }
+    }
+
+    /// 请求 gzip 响应压缩（**只影响服务端 → 客户端**方向，省下行流量）。
+    ///
+    /// 不提供 `send_compressed`：客户端上行只有 SubscribeRequest / Ping，
+    /// 几十字节，压了没收益；反而要求服务端开 `compression.accept`，
+    /// 有些服务商为了省 CPU 会关掉，发了压缩请求会直接被拒。
+    pub fn gzip(mut self) -> Self {
+        self.accept_compression = Some(CompressionEncoding::Gzip);
+        self
+    }
+
+    /// 关闭响应压缩（默认行为，保留给需要显式表达的调用方）。
+    pub fn no_compression(mut self) -> Self {
+        self.accept_compression = None;
+        self
     }
 
     pub async fn build_client(self) -> Result<Arc<Mutex<GeyserGrpcClient>>, AppError> {
-        let client = GeyserGrpcClient::build_from_shared(self.endpoint)?
+        let accept_compression = self.accept_compression;
+        let mut builder = GeyserGrpcClient::build_from_shared(self.endpoint)?
             .x_token(self.x_token)?
-            .tls_config(ClientTlsConfig::new().with_native_roots())?
+            .tls_config(ClientTlsConfig::new().with_native_roots())?;
+
+        // 只对「服务端 → 客户端」方向请求压缩，这是流量的大头（交易/账户推送）。
+        if let Some(encoding) = accept_compression {
+            builder = builder.accept_compressed(encoding);
+        }
+
+        let client = builder
             .connect_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
             .timeout(Duration::from_secs(60))
