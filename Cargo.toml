@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ahash = "0.8.12"
 anyhow = "1.0.104"
+log = "0.4"
 bincode = "1.3.3"
 solana-account-decoder-client-types = "4.2.2"
 solana-sdk = { version = "4.0.0", default-features = false, features = ["full"] }

@@ -327,6 +327,91 @@ impl From<SubscribeUpdateTransaction> for TransactionFormat {
     }
 }
 
+// ── HTTP/2 keep-alive ────────────────────────────────────────────────────────
+//
+// ⚠️ tonic 的 keep_alive_while_idle(true) 只是「空闲时也发 PING」的开关，
+// **真正决定发不发 PING 的是 http2_keep_alive_interval**。只设前者而不设
+// 后者，一个 PING 都不会发 —— 这是个静默的 no-op，看起来配了心跳其实没有。
+//
+// 没有 PING 的后果：NAT / LB / 云安全组按空闲回收 TCP 时（常见 60s~350s），
+// 连接变成半开（对端没发 FIN/RST），客户端的 stream.next() 会**永远挂住**，
+// 既不报错也不重连，表现为「进程还活着但一笔交易都不推了」。
+//
+// 默认 30s / 10s：比常见空闲回收阈值短，一个心跳周期内就能判死半开连接，
+// 让 stream 返回 Err，交给调用方的重连循环。
+pub const DEFAULT_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
+/// 发出 PING 后等 ACK 的上限；超时即判连接已死。
+pub const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: u64 = 10;
+
+const ENV_KEEP_ALIVE_INTERVAL: &str = "GRPC_KEEP_ALIVE_INTERVAL_SECS";
+const ENV_KEEP_ALIVE_TIMEOUT: &str = "GRPC_KEEP_ALIVE_TIMEOUT_SECS";
+
+/// HTTP/2 心跳参数（秒级）。调用方一般不用手动构造，[YellowstoneGrpc::build_client]
+/// 会用 [GrpcKeepAlive::from_env] 读环境变量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrpcKeepAlive {
+    /// 两次 PING 之间的间隔。
+    pub interval: Duration,
+    /// 一次 PING 等 ACK 的超时。
+    pub timeout: Duration,
+}
+
+impl Default for GrpcKeepAlive {
+    fn default() -> Self {
+        Self::from_secs(
+            DEFAULT_KEEP_ALIVE_INTERVAL_SECS,
+            DEFAULT_KEEP_ALIVE_TIMEOUT_SECS,
+        )
+    }
+}
+
+impl GrpcKeepAlive {
+    /// 规范化：间隔至少 1s；超时夹在 1s..=interval。
+    ///
+    /// 超时大于间隔只会让 PING 在队列里堆积（每个周期都还没等到上一个 ACK），
+    /// 没有任何收益，所以直接夹住。
+    pub fn from_secs(interval_secs: u64, timeout_secs: u64) -> Self {
+        let interval_secs = interval_secs.max(1);
+        Self {
+            interval: Duration::from_secs(interval_secs),
+            timeout: Duration::from_secs(timeout_secs.clamp(1, interval_secs)),
+        }
+    }
+
+    /// 从环境变量读取：
+    /// - GRPC_KEEP_ALIVE_INTERVAL_SECS（默认 30）
+    /// - GRPC_KEEP_ALIVE_TIMEOUT_SECS（默认 10）
+    ///
+    /// 变量名与 nonce_cache 共用，方便统一调。非法值（非正整数）回落默认。
+    pub fn from_env() -> Self {
+        Self::from_secs(
+            env_secs(ENV_KEEP_ALIVE_INTERVAL, DEFAULT_KEEP_ALIVE_INTERVAL_SECS),
+            env_secs(ENV_KEEP_ALIVE_TIMEOUT, DEFAULT_KEEP_ALIVE_TIMEOUT_SECS),
+        )
+    }
+}
+
+/// 解析正整数秒；空串 / 0 / 负数 / 非数字都返回 None。
+fn parse_secs(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|v| *v > 0)
+}
+
+fn env_secs(key: &str, default: u64) -> u64 {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(raw) => match parse_secs(&raw) {
+            Some(v) => v,
+            None => {
+                log::warn!(
+                    "⚠️ {}={:?} 非法（需要正整数秒），回落默认 {}s",
+                    key, raw, default
+                );
+                default
+            }
+        },
+    }
+}
+
 pub struct YellowstoneGrpc {
     endpoint: String,
     x_token: Option<String>,
@@ -378,12 +463,69 @@ impl YellowstoneGrpc {
             builder = builder.accept_compressed(encoding);
         }
 
+        // HTTP/2 心跳：必须「间隔 + 超时 + 空闲也发」三个一起配。
+        // 少了 http2_keep_alive_interval，keep_alive_while_idle 是空操作，一个
+        // PING 都不会发 —— 半开连接就会永远挂在 stream.next() 上（见文件头部说明）。
+        let keep_alive = GrpcKeepAlive::from_env();
+        log::info!(
+            "💓 gRPC HTTP/2 心跳：间隔 {}s / 超时 {}s（空闲也发 PING）",
+            keep_alive.interval.as_secs(),
+            keep_alive.timeout.as_secs()
+        );
+
         let client = builder
             .connect_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(keep_alive.interval)
+            .keep_alive_timeout(keep_alive.timeout)
             .keep_alive_while_idle(true)
             .timeout(Duration::from_secs(60))
             .connect()
             .await?;
         Ok(Arc::new(Mutex::new(client)))
+    }
+}
+
+#[cfg(test)]
+mod keep_alive_tests {
+    use super::*;
+
+    #[test]
+    fn parse_secs_accepts_positive_integers() {
+        assert_eq!(parse_secs("30"), Some(30));
+        assert_eq!(parse_secs(" 7 "), Some(7));
+    }
+
+    #[test]
+    fn parse_secs_rejects_garbage() {
+        assert_eq!(parse_secs(""), None);
+        assert_eq!(parse_secs("0"), None);
+        assert_eq!(parse_secs("-1"), None);
+        assert_eq!(parse_secs("1.5"), None);
+        assert_eq!(parse_secs("abc"), None);
+    }
+
+    #[test]
+    fn defaults_are_sane() {
+        let ka = GrpcKeepAlive::default();
+        assert_eq!(ka.interval, Duration::from_secs(DEFAULT_KEEP_ALIVE_INTERVAL_SECS));
+        assert_eq!(ka.timeout, Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS));
+        // 心跳间隔必须短于常见的 NAT/LB 空闲回收阈值（60s 起）。
+        assert!(ka.interval < Duration::from_secs(60));
+        assert!(ka.timeout < ka.interval);
+    }
+
+    #[test]
+    fn from_secs_clamps_degenerate_values() {
+        // 0 不能变成「每 tick 都发 PING」或「永远超时」。
+        assert_eq!(GrpcKeepAlive::from_secs(0, 0).interval, Duration::from_secs(1));
+        assert_eq!(GrpcKeepAlive::from_secs(0, 0).timeout, Duration::from_secs(1));
+        // 超时 > 间隔：夹到间隔，避免 PING 排队堆积。
+        let ka = GrpcKeepAlive::from_secs(5, 30);
+        assert_eq!(ka.interval, Duration::from_secs(5));
+        assert_eq!(ka.timeout, Duration::from_secs(5));
+        // 合法值原样保留。
+        let ka = GrpcKeepAlive::from_secs(30, 10);
+        assert_eq!(ka.interval, Duration::from_secs(30));
+        assert_eq!(ka.timeout, Duration::from_secs(10));
     }
 }
